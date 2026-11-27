@@ -98,11 +98,6 @@ function isAppRunningInBackground(app, windowsCount) {
         return false;
     if (windowsCount > 0)
         return true;
-    if (app.state === Shell.AppState.RUNNING)
-        return true;
-    const pids = app.get_pids ? app.get_pids() : [];
-    if (pids && pids.length > 0)
-        return true;
 
     const id = app.get_id ? app.get_id() : '';
     if (id === 'launchpad.desktop' || id.startsWith('location:'))
@@ -114,22 +109,25 @@ function isAppRunningInBackground(app, windowsCount) {
     const exec = info.get_executable ? info.get_executable() : null;
     if (!exec)
         return false;
-    const base = GLib.path_get_basename(exec);
+    const base = GLib.path_get_basename(exec).toLowerCase();
     if (!base || base.endsWith('.sh'))
         return false;
 
-    const comms = getRunningProcessComms();
-    if (comms.has(base) || comms.has(base.slice(0, 15)))
-        return true;
-
-    if (base.includes('chrome') && (comms.has('chrome') || comms.has('google-chrome')))
-        return true;
-    if (base.includes('telegram') && (comms.has('telegram-deskto') || comms.has('Telegram')))
-        return true;
-    if (base.includes('steam') && (comms.has('steam') || comms.has('steamwebhelper')))
-        return true;
-    if (base.includes('opencode') && (comms.has('opencode') || comms.has('ai.opencode.desktop')))
-        return true;
+    // Only keep the running dot with 0 windows for true tray/background apps;
+    // regular GTK/GApplication apps (e.g. Nautilus, Settings, Text Editor) linger
+    // in /proc for ~10s after their last window closes and should clear immediately.
+    if (base.includes('telegram')) {
+        const comms = getRunningProcessComms();
+        return comms.has('telegram-deskto') || comms.has('Telegram');
+    }
+    if (base.includes('steam')) {
+        const comms = getRunningProcessComms();
+        return comms.has('steam') || comms.has('steamwebhelper');
+    }
+    if (base.includes('discord')) {
+        const comms = getRunningProcessComms();
+        return comms.has('Discord') || comms.has('discord');
+    }
 
     return false;
 }
@@ -425,22 +423,22 @@ export const DockAbstractAppIcon = GObject.registerClass({
         }
     }
 
-    _startBackgroundWatcher() {
+    _startBackgroundWatcher(delayMs = 150) {
         if (this._bgWatcherId)
             return;
-        this._bgWatcherId = GLib.timeout_add(GLib.PRIORITY_LOW, 2000, () => {
-            if (!this.running || this.windowsCount > 0) {
-                this._bgWatcherId = 0;
+        this._bgWatcherId = GLib.timeout_add(GLib.PRIORITY_DEFAULT_IDLE, delayMs, () => {
+            this._bgWatcherId = 0;
+            if (!this.running || this.windowsCount > 0)
                 return GLib.SOURCE_REMOVE;
-            }
             _cachedRunningComms = null;
             const stillRunning = isAppRunningInBackground(this.app, this.windowsCount);
             if (!stillRunning) {
                 this.running = false;
-                this._bgWatcherId = 0;
                 return GLib.SOURCE_REMOVE;
             }
-            return GLib.SOURCE_CONTINUE;
+            const nextDelay = delayMs < 400 ? 350 : 1500;
+            this._startBackgroundWatcher(nextDelay);
+            return GLib.SOURCE_REMOVE;
         });
     }
 
@@ -452,9 +450,11 @@ export const DockAbstractAppIcon = GObject.registerClass({
     }
 
     _updateRunningState() {
+        if (this.windowsCount === 0)
+            _cachedRunningComms = null;
         this.running = isAppRunningInBackground(this.app, this.windowsCount);
         if (this.running && this.windowsCount === 0)
-            this._startBackgroundWatcher();
+            this._startBackgroundWatcher(150);
         else
             this._stopBackgroundWatcher();
     }
@@ -2026,23 +2026,31 @@ function _updateTailPosition(label, position) {
         arrowBoxH = arrowH;
     }
 
+    if (!tail || tail._macDestroyed || tail.is_finalized?.() || !tail.get_stage?.())
+        return;
+
     tail.set_size(Math.round(tailW), Math.round(tailH));
     tail.set_position(Math.round(posX), Math.round(posY));
-    try {
-        const tBox = new Clutter.ActorBox();
-        tBox.x1 = posX;
-        tBox.y1 = posY;
-        tBox.x2 = posX + tailW;
-        tBox.y2 = posY + tailH;
-        tail.allocate(tBox);
-    } catch (_) {}
+    if (tail.visible) {
+        try {
+            const tBox = new Clutter.ActorBox();
+            tBox.x1 = posX;
+            tBox.y1 = posY;
+            tBox.x2 = posX + tailW;
+            tBox.y2 = posY + tailH;
+            tail.allocate(tBox);
+        } catch (_) {}
+    }
 
-    if (label._blurActor) {
-        label._blurActor.set_size(pillWidth, pillHeight);
-        label._blurActor.set_position(lx, ly);
-        if (label._blurActor._blurEff && 'corner_radius' in label._blurActor._blurEff) {
-            label._blurActor._blurEff.corner_radius = Math.round(pillHeight / 2);
+    const blurActor = label._blurActor;
+    if (blurActor && !blurActor._macDestroyed && !blurActor.is_finalized?.() && blurActor.get_stage?.()) {
+        blurActor.set_size(pillWidth, pillHeight);
+        blurActor.set_position(lx, ly);
+        if (blurActor._blurEff && 'corner_radius' in blurActor._blurEff) {
+            blurActor._blurEff.corner_radius = Math.round(pillHeight / 2);
         }
+    } else if (blurActor && (blurActor._macDestroyed || blurActor.is_finalized?.())) {
+        label._blurActor = null;
     }
 
     tail.queue_repaint();
@@ -2064,12 +2072,20 @@ function _ensureLabelTail(label, position) {
         labelBlurEff.enabled = false;
     }
 
+    if (label._blurActor && (label._blurActor._macDestroyed || label._blurActor.is_finalized?.()))
+        label._blurActor = null;
+
     if (!label._blurActor) {
         const blurActor = new St.Widget({
             style_class: 'dash-label-blur-pill',
             reactive: false,
         });
         blurActor.set_style('background-color: transparent !important; background: transparent !important; border: none !important; box-shadow: none !important;');
+        blurActor.connect('destroy', () => {
+            blurActor._macDestroyed = true;
+            if (label._blurActor === blurActor)
+                label._blurActor = null;
+        });
         label._blurActor = blurActor;
 
         const cfg = globalThis._macLabelStylingConfig || { blur: 20, tint: 20, shadow: 25 };
@@ -2357,7 +2373,7 @@ export function itemShowLabel() {
             other.opacity = 0;
             other.hide();
             for (const sub of [other._blurActor, other._arrowTailActor]) {
-                if (sub) {
+                if (sub && !sub._macDestroyed && !sub.is_finalized?.() && sub.get_stage?.()) {
                     sub.remove_all_transitions();
                     sub.opacity = 0;
                     sub.hide();
